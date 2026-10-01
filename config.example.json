@@ -1,0 +1,10 @@
+{
+  "_readme": [
+    "可选配置。把本文件复制为 config.json 才会生效。",
+    "只有「失败」时才会推送通知；签到成功一律不打扰。",
+    "两个渠道都可以留空；留空则只写本地 signin.log。",
+    "config.json 里不要放 accessToken —— 凭据始终从本机登录态文件实时读取，不落任何配置文件。"
+  ],
+  "serverchan_sendkey": "",
+  "wecom_webhook": ""
+}
