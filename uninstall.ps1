@@ -1,7 +1,10 @@
 <#
-    uninstall.ps1 -- remove the scheduled tasks registered by install.ps1.
+    uninstall.ps1 -- remove the scheduled task registered by install.ps1.
 
     ASCII-only on purpose (see the note in install.ps1).
+
+    Also cleans up the legacy <prefix>-Main / <prefix>-Poll pair, which older
+    versions of install.ps1 registered on a fixed clock-time schedule.
 
     Example:
         powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
@@ -13,14 +16,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$names = @("$TaskPrefix-Main", "$TaskPrefix-Poll")
+# The current single task first, then the legacy pair.
+$names = @("$TaskPrefix", "$TaskPrefix-Main", "$TaskPrefix-Poll")
 $removed = 0
 
 foreach ($name in $names) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if ($task) {
         Unregister-ScheduledTask -TaskName $name -Confirm:$false
-        Write-Host "Removed : $name"
+        Write-Host "Removed  : $name"
         $removed++
     }
     else {

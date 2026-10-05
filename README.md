@@ -129,38 +129,66 @@ python wb_signin.py auto      # 默认：先查状态 → 已签跳过 → 未�
 
 ## 定时任务
 
-`install.ps1` 注册两个任务（都无需管理员权限，都以 `pythonw.exe` 运行，不弹窗）：
+`install.ps1` 只注册**一个**任务 `WB-SignIn`（无需管理员权限，以 `pythonw.exe` 运行，不弹窗），
+但给它挂了三个触发器：
 
-| 任务名 | 触发时间 | 时间上限 | 作用 |
-|---|---|---|---|
-| `WB-SignIn-Main` | 每天 **09:10** | 10 分钟 | 主签到 |
-| `WB-SignIn-Poll` | 每天 **12:00 / 15:00 / 18:00 / 21:00** | 5 分钟 | 兜底补签 |
+| 触发器 | 时机 | 作用 |
+|---|---|---|
+| 心跳 | **每 30 分钟一次**，无限重复 | 机器只要醒着，最多 30 分钟就会跑一次 |
+| 登录 | 登录后 30 秒 | 开机 / 重新登录后立刻补上 |
+| 解锁 | 锁屏解锁后 | 合盖睡眠唤醒、解锁后立刻补上 |
 
-**为什么要两个任务**：主任务万一撞上关机、睡眠或刚开机网络没就绪，当天就再没机会了、连签直接断。
-兜底轮询每次都会先查状态，**已签的话只发一个查询请求就退出**，代价可以忽略，换来的是一天五次补救机会。
+### 为什么不用固定时点（这是踩过的坑）
 
-两个任务都开启了：
+早期版本用的是固定时刻：主任务 **09:10** + 兜底 **12:00 / 15:00 / 18:00 / 21:00**。
+看着很合理，实际在笔记本上完全靠不住 —— 2026-10-05 那天一分都没领到：
 
-- **错过计划后尽快启动** —— 关机期间错过的任务，下次开机自动补跑
-- **唤醒计算机执行** —— 睡眠状态下到点可唤醒（不想用可以加 `-NoWake`）
+- 09:10 和 12:00 两个时点机器都在睡眠（当天 **12:03** 才唤醒），双双落空；
+- 任务的「唤醒计算机执行」形同虚设：本机电源计划的「允许使用唤醒定时器」是
+  **交流 = 仅限重要的唤醒定时器 / 电池 = 禁用**，而第三方计划任务不算「重要」，唤不醒；
+- Windows 的「错过计划后尽快启动」也并不可靠 —— 同样是错过的 09:10，
+  10-04 补跑了（延迟 1 小时 41 分），10-03 和 10-05 就没补。
+
+固定时点的根本问题在于，**它假设机器在某个时刻一定是醒着的**，而这个假设不成立。
+换成「心跳 + 登录 + 解锁」之后，签到只依赖「机器醒着」这一个条件 —— 而这一条必然成立。
+
+### 为什么可以这么频繁
+
+脚本天然幂等：每次都先查状态，已签就直接退出。所以绝大多数心跳只花 **1 次 HTTPS 请求**
+（约 1 KB），一天约 28 次。同机同 IP、低频，不构成风控风险；签到接口本身也幂等，
+重复调用只会返回「今天已签到」，不可能重复领取。
+
+> 活动 2026-10-15 结束后，可以把间隔调大（`-IntervalMinutes 60`）或者直接卸载。
+
+任务还开启了：
+
+- **错过计划后尽快启动** —— 关机 / 睡眠期间错过的，恢复后补跑
+- **电池上照常运行** —— 不因为拔了电源就罢工
+- **多实例忽略** —— 永远只有一个实例在跑，不会自己撞自己
 
 自定义安装：
 
 ```powershell
-# 改主任务时间
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -MainTime "08:30"
+# 改心跳间隔（默认 30 分钟，不建议低于 15）
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -IntervalMinutes 60
 
-# 改兜底时间
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -PollTimes "11:00","14:00","19:00"
+# 改心跳的起始时点
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -StartAt "09:00"
 
 # 手动指定解释器（自动探测失败时）
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Pythonw "D:\miniconda\pythonw.exe"
+
+# 如果你的电源计划允许唤醒定时器，想让任务顺便把机器唤醒
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -EnableWake
 ```
 
-> 脚本会自动优先选择**非 WorkBuddy 自带**的 Python——因为自带运行时装在带版本号的目录里，
+> 脚本会自动优先选择**非 WorkBuddy 自带**的 Python —— 因为自带运行时装在带版本号的目录里，
 > WorkBuddy 升级后可能被移走，会导致任务静默失效。可以用环境变量 `WORKBUDDY_PYTHONW` 覆盖。
+>
+> 安装脚本会读一下电源计划的唤醒定时器设置并给出提示，但**不会**去改它 ——
+> 改电源计划需要管理员权限，而这个脚本刻意只需要普通权限。
 
-卸载（不会删除日志和状态文件）：
+卸载（不会删除日志和状态文件；也会顺带清理旧版留下的 `WB-SignIn-Main` / `WB-SignIn-Poll`）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
@@ -169,7 +197,14 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 核验：
 
 ```powershell
-schtasks /query /tn "WB-SignIn-Main" /fo LIST /v
+# 看三个触发器是否都在
+powershell -Command "Get-ScheduledTask -TaskName WB-SignIn | Select -Expand Triggers"
+# 上次运行时间、下次运行时间、上次退出码
+powershell -Command "Get-ScheduledTaskInfo -TaskName WB-SignIn"
+# 立刻手动跑一次
+powershell -Command "Start-ScheduledTask -TaskName WB-SignIn"
+# 日志与状态
+python wb_signin.py doctor
 Get-Content .\signin.log -Tail 5
 Get-Content .\state.json
 ```
@@ -205,7 +240,7 @@ wb_signin.py          主脚本（单文件，纯标准库）
 install.ps1           注册计划任务
 uninstall.ps1         移除计划任务
 config.example.json   通知配置模板（复制为 config.json 才生效）
-state.json            脚本自建：当日签到状态，含连续天数、累计积分、触发来源
+state.json            脚本自建：当日签到状态 + 运行心跳（上次运行、上次成功、已错过天数）
 signin.log            运行日志，按天轮转，保留 30 天
 ```
 
@@ -242,6 +277,23 @@ signin.log            运行日志，按天轮转，保留 30 天
 
 **Q：积分没到账？**
 脚本会回读校验并在日志里写明。如果回读发现状态没变，会打一条 warning，据此排查。
+
+**Q：怎么确认计划任务到底跑了没有？**
+跑 `python wb_signin.py doctor`。它会打印状态文件概览：**上次运行时间、上次成功签到日期、
+已错过的天数**。
+
+这里有个容易踩的坑：脚本**只在运行过的时候才写日志**，所以「日志里什么都没有」既可能是
+顺利跳过（当天已签，静默退出），也可能是任务根本没被触发 —— 光看日志分不出来。
+`state.json` 里的心跳字段（`last_run_ts` / `last_success_date`）才是能区分这两者的东西，
+所以 `auto` / `claim` 的**每一次**运行都会写它，包括失败和登录态被瞬时占用。
+
+另外脚本会自己盯两件事，命中就记一条 WARNING（若配了通知渠道则同时推送）：
+
+- 距上次运行超过 **26 小时** —— 任务可能长时间没被触发（机器本来就关着则属正常）；
+- 已整段漏签（**昨天没签上**）—— 连签已断，需要人工看一下。
+
+局限要说清楚：如果机器整天不开机，脚本就不会运行，也就无从报警。所以真正兜底的是
+上面那三个触发器（心跳 / 登录 / 解锁），而不是这两个告警。
 
 ---
 

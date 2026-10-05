@@ -13,6 +13,14 @@ WorkBuddy 每日自动签到脚本（单文件 · 纯标准库 · 零依赖）
     · 不做多账号批量（平台风控风险高）
     · 不把 accessToken 打印、写入日志或落盘（accessToken 等同登录密码）
 
+可观测性
+    auto / claim 的**每一次**运行（含失败、含登录态文件被瞬时占用）都会写 state.json，
+    留下 last_run_ts / last_result / last_success_date / consecutive_miss_days。
+    原因是脚本只在「运行过」的时候才写日志 —— 「任务根本没被触发」在日志里全无痕迹，
+    只有靠这些字段才能在**下一次**运行时把那次沉默暴露出来。
+    另外：距上次运行超过 HEARTBEAT_GAP_HOURS 小时、或整段漏签达到 MISS_ALERT_DAYS 天，
+    会记一条 WARNING；配了通知渠道时同时推送。
+
 子命令
     doctor   离线自检：凭据文件是否存在、字段是否齐全、是否已过期。不联网。
     status   只读查询：今天签了没、连续天数、累计积分、活动起止时间。
@@ -77,6 +85,11 @@ FALLBACK_DOMAIN = "www.workbuddy.cn"
 HTTP_TIMEOUT = 20                       # 单次请求超时（秒）
 BACKOFF_SCHEDULE = (1, 3, 8)            # 可重试错误的退避间隔
 DEFAULT_BUDGET = 420                    # 单次运行的时间预算（秒）
+
+# 可观测性阈值。脚本只在「运行过」的时候才写日志，所以「任务根本没被触发」
+# 在日志里是全无痕迹的 —— 下面两个阈值让这种沉默在下一次运行时暴露出来。
+MISS_ALERT_DAYS = 1                     # 整段漏掉这么多天（=昨天没签上）就告警
+HEARTBEAT_GAP_HOURS = 26                # 距上次运行超过这么多小时就怀疑任务没触发
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -657,7 +670,7 @@ def write_state(**values: Any) -> None:
     state.update(values)
     tmp = STATE_FILE.with_suffix(".json.tmp")
     try:
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         tmp.replace(STATE_FILE)
     except OSError as exc:
         LOGGER.warning("写入状态文件失败：%s", exc)
@@ -665,6 +678,29 @@ def write_state(**values: Any) -> None:
 
 def today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _missed_days(last_success_date: Any) -> int | None:
+    """从上次成功签到算起，「已经整段错过的天数」。
+
+    昨天成功 → 0；前天成功（昨天漏了）→ 1。无法解析时返回 None。
+    """
+    if not isinstance(last_success_date, str):
+        return None
+    try:
+        prev = datetime.strptime(last_success_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return max(0, (datetime.now().date() - prev).days - 1)
 
 
 # --------------------------------------------------------------------------
@@ -793,12 +829,43 @@ def _auth_failure(exc: AuthError, *, prefix: str = "") -> Result:
 # --------------------------------------------------------------------------
 
 
+def report_state_overview() -> None:
+    """离线打印状态文件概览 —— 用来一眼确认「任务到底跑没跑」。"""
+    state = read_state()
+    say("")
+    say("状态文件概览：")
+    if not state:
+        say("  （没有记录，说明还没有成功运行过）")
+        return
+
+    last_run = state.get("last_run_ts") or state.get("ts")
+    source = state.get("last_source") or state.get("source") or "未知"
+    outcome = state.get("last_result") or state.get("status") or "未知"
+    say(f"  上次运行     : {last_run or '未知'}（来源 {source}，结果 {outcome}）")
+
+    last_run_dt = _parse_ts(last_run)
+    if last_run_dt is not None:
+        hours = (datetime.now() - last_run_dt).total_seconds() / 3600.0
+        flag = f"  [超过 {HEARTBEAT_GAP_HOURS} 小时，任务可能没被触发]" if hours > HEARTBEAT_GAP_HOURS else ""
+        say(f"  距今         : {hours:.1f} 小时{flag}")
+
+    success = state.get("last_success_date")
+    say(f"  上次成功签到 : {success or '未知'}")
+    missed = _missed_days(success)
+    if missed is not None:
+        say(f"  已错过天数   : {missed}（达到 {MISS_ALERT_DAYS} 天会告警）")
+
+    signed_today = bool(state.get("signed")) and state.get("date") == today()
+    say(f"  今天         : {'已签到' if signed_today else '未签到'}")
+
+
 def cmd_doctor(args: argparse.Namespace) -> Result:
     say(f"运行时：Python {sys.version.split()[0]} ({sys.executable})")
     say(f"脚本目录：{SCRIPT_DIR}")
     say(f"日志文件：{LOG_FILE}")
     say(f"状态文件：{STATE_FILE}")
     say(f"配置文件：{CONFIG_FILE} ({'存在' if CONFIG_FILE.exists() else '不存在，通知功能跳过'})")
+    report_state_overview()
 
     say("\n登录态文件候选路径：")
     for candidate in auth_file_candidates():
@@ -962,6 +1029,12 @@ def cmd_auto(args: argparse.Namespace) -> Result:
 
 
 def _run_auto(args: argparse.Namespace, *, force: bool) -> Result:
+    # 先做历史体检：这两步专门用来暴露「任务根本没被触发」和「已经连续多日没签上」。
+    # 落盘不在这里做 —— 由 main() 在所有出口统一写，保证失败也留痕。
+    prev = read_state()
+    _check_history(prev)
+    _alert_if_missed(prev)
+
     try:
         creds = load_credentials()
     except AuthError as exc:
@@ -998,7 +1071,6 @@ def _run_auto(args: argparse.Namespace, *, force: bool) -> Result:
         if status.already_signed is True:
             report = human_report(status, prefix="今日已签到，跳过") or "今日已签到，跳过"
             LOGGER.info(report)
-            _persist(state="already", status=status, dry_run=args.dry_run)
             return Result("already", report, EXIT_OK, detail=status_detail(status))
 
         if status.already_signed is None:
@@ -1010,7 +1082,6 @@ def _run_auto(args: argparse.Namespace, *, force: bool) -> Result:
         if exc.kind == "already":
             report = "签到接口返回「今日已签到」，视为成功（幂等，不会重复领取）"
             LOGGER.info(report)
-            _persist(state="already", status=status, dry_run=args.dry_run)
             return Result("already", report, EXIT_OK, detail=status_detail(status))
         return _api_failure(creds, exc, phase="领取每日积分")
 
@@ -1062,32 +1133,102 @@ def _run_auto(args: argparse.Namespace, *, force: bool) -> Result:
     report = "，".join(str(b) for b in bits)
 
     LOGGER.info(report)
-    _persist(state="claimed", status=verified or status, dry_run=args.dry_run, extra=info)
 
-    return Result(
-        "claimed",
-        report,
-        EXIT_OK,
-        detail={"reward": reward, "streak_days": streak, "total_credits": total},
-    )
+    # 落盘内容：status_detail 取回读结果（没有回读就退回预检），再叠加签到接口
+    # 的原始回报和最终采用的数值。统一由 main() 写出。
+    detail: dict[str, Any] = status_detail(verified or status)
+    detail.update({k: v for k, v in info.items() if v is not None})
+    detail.update({"reward": reward, "streak_days": streak, "total_credits": total})
+
+    return Result("claimed", report, EXIT_OK, detail=detail)
 
 
-def _persist(*, state: str, status: CheckinStatus | None, dry_run: bool, extra: dict[str, Any] | None = None) -> None:
-    if dry_run:
+def _check_history(prev: dict[str, Any]) -> None:
+    """运行开头的历史体检，专门用来暴露「任务根本没被触发」。
+
+    脚本只在运行过的时候才写日志，所以整天没跑在日志里连一行都不会有。
+    上一次运行留下的 last_run_ts 是唯一能证明这件事的线索。
+    """
+    last_run = _parse_ts(prev.get("last_run_ts"))
+    if last_run is None:
         return
+    gap_hours = (datetime.now() - last_run).total_seconds() / 3600.0
+    if gap_hours > HEARTBEAT_GAP_HOURS:
+        LOGGER.warning(
+            "距上次运行已 %.1f 小时（阈值 %d 小时）。如果这台机器本来就长时间关机或睡眠，"
+            "属于正常；否则请检查计划任务是否启用、电源计划是否允许唤醒定时器。",
+            gap_hours, HEARTBEAT_GAP_HOURS,
+        )
+
+
+def _alert_if_missed(prev: dict[str, Any]) -> None:
+    """连续多日没签成功就告警。一天只报一次，免得半小时一次的心跳变成刷屏。"""
+    missed = _missed_days(prev.get("last_success_date"))
+    if missed is None or missed < MISS_ALERT_DAYS:
+        return
+    if prev.get("last_miss_alert_date") == today():
+        return
+
+    message = (
+        f"连续 {missed} 天没有成功签到（上次成功：{prev.get('last_success_date')}）。"
+        "请检查计划任务是否正常触发、登录态是否仍有效。"
+    )
+    LOGGER.error(message)
+    notify_failure("WorkBuddy 签到已连续多日未成功", message)
+    write_state(last_miss_alert_date=today())
+
+
+def _persist(*, state: str, detail: dict[str, Any] | None = None,
+             exit_code: int = EXIT_OK, extra: dict[str, Any] | None = None) -> None:
+    """把本次运行的结果落盘。
+
+    由 main() 在 auto / claim 的**所有**出口统一调用，包括失败和凭据瞬时占用。
+    旧版只在 already / claimed 时写，导致「跑过但失败」和「根本没跑」在
+    state.json 里长得一模一样 —— 2026-10-05 那次排障就是被这一点瞒了 4 天。
+    """
+    now = datetime.now()
+    today_str = today()
+    prev = read_state()
+    success = state in ("claimed", "already")
+
+    if success:
+        signed = True
+    elif prev.get("date") == today_str:
+        # 今天早些时候已经确认签过，别被后来的某次失败覆盖
+        signed = bool(prev.get("signed"))
+    else:
+        signed = False
+
     values: dict[str, Any] = {
-        "date": today(),
-        "signed": state == "claimed" or state == "already",
+        "date": today_str,
+        "signed": signed,
         "status": state,
-        "ts": datetime.now().isoformat(timespec="seconds"),
+        "ts": now.isoformat(timespec="seconds"),
         "source": TRIGGER,
+        # 心跳三件套：下一次运行时用它判断「距上次运行过了多久」
+        "last_run_ts": now.isoformat(timespec="seconds"),
+        "last_result": state,
+        "last_source": TRIGGER,
+        "last_exit_code": exit_code,
     }
-    if status is not None:
-        values.update({k: v for k, v in status_detail(status).items() if v is not None})
+
+    if success:
+        values["last_success_date"] = today_str
+        values["consecutive_miss_days"] = 0
+    else:
+        missed = _missed_days(prev.get("last_success_date"))
+        if missed is not None:
+            values["consecutive_miss_days"] = missed
+
+    if detail:
+        for key, value in detail.items():
+            if value is not None:
+                values[key] = value
     if extra:
         for key, value in extra.items():
             if value is not None:
                 values[key] = value
+
     write_state(**values)
 
 
@@ -1140,6 +1281,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # 兜底：任何未预期异常都要留下日志
         LOGGER.exception("未预期的异常")
         result = Result("failed", f"未预期的异常：{type(exc).__name__}: {exc}", EXIT_ERROR, notify=True)
+
+    # 只有真正会改动服务端状态的子命令才落盘 —— status / doctor 承诺是只读的。
+    # 放在这里而不是各个 return 之前，是为了让**失败和凭据瞬时占用也能留痕**：
+    # 否则「跑过但失败」和「根本没跑」在 state.json 里长得一模一样。
+    if args.command in ("auto", "claim") and not args.dry_run:
+        _persist(state=result.status, detail=result.detail, exit_code=result.exit_code)
 
     if result.notify and not args.no_notify:
         notify_failure(f"WorkBuddy 签到需要处理（{result.status}）", result.message)
